@@ -1,4 +1,36 @@
-# circuit-tracer
+# circuit-tracer (Personal Fork)
+
+> **⚠️ This is a personal fork by [@JoeLuker](https://github.com/JoeLuker) for experimentation and testing.**  
+> **📍 For the official repository and latest updates, please visit: https://github.com/safety-research/circuit-tracer**
+
+## About This Fork
+
+This fork contains experimental modifications and testing of the circuit-tracer library, including:
+- 🐛 **Debug mode with invariance checks** - Comprehensive validation system for development
+- 📚 **Enhanced documentation** - Additional usage examples and guides  
+- 🧪 **Personal experiments** - Various modifications for learning and testing
+
+### New Features in This Fork
+
+#### Debug Mode with Invariance Checks
+Enable comprehensive validation during development:
+```bash
+export CIRCUIT_TRACER_DEBUG=true
+circuit-tracer attribute -t gemma -p "test prompt" -o graph.pt
+```
+
+This enables extensive checks for:
+- Matrix dimension validation
+- Graph structure integrity  
+- Numerical stability (NaN/Inf detection)
+- Algorithm convergence properties
+- Input validation
+
+See `CLAUDE.md` for detailed documentation.
+
+---
+
+## Original Project Description
 
 This library implements tools for finding circuits using features from (cross-layer) MLP transcoders, as originally introduced by [Ameisen et al. (2025)](https://transformer-circuits.pub/2025/attribution-graphs/methods.html) and [Lindsey et al. (2025)](https://transformer-circuits.pub/2025/attribution-graphs/biology.html).
 

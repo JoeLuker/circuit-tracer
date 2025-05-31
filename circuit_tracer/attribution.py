@@ -33,6 +33,7 @@ from einops import einsum
 from tqdm import tqdm
 from transformer_lens.hook_points import HookPoint
 
+from circuit_tracer.config import DEBUG_MODE
 from circuit_tracer.graph import Graph
 from circuit_tracer.replacement_model import ReplacementModel
 from circuit_tracer.utils.disk_offload import offload_modules
@@ -71,7 +72,36 @@ class AttributionContext:
         decoder_vecs: torch.Tensor,
         feature_output_hook: str,
     ) -> None:
-        n_layers, n_pos, _ = activation_matrix.shape
+        n_layers, n_pos, n_features = activation_matrix.shape
+        d_model = error_vectors.shape[-1]
+        
+        # Debug invariance checks
+        if DEBUG_MODE:
+            # Check activation matrix shape consistency
+            assert activation_matrix.ndim == 3, f"Activation matrix must be 3D, got {activation_matrix.ndim}"
+            assert activation_matrix.is_sparse, "Activation matrix must be sparse"
+            
+            # Check error vectors shape
+            assert error_vectors.shape == (n_layers, n_pos, d_model), (
+                f"Error vectors shape mismatch: expected {(n_layers, n_pos, d_model)}, "
+                f"got {error_vectors.shape}"
+            )
+            
+            # Check token vectors shape
+            assert token_vectors.shape == (n_pos, d_model), (
+                f"Token vectors shape mismatch: expected {(n_pos, d_model)}, "
+                f"got {token_vectors.shape}"
+            )
+            
+            # Check decoder vectors match active features
+            assert decoder_vecs.shape[0] == activation_matrix._nnz(), (
+                f"Decoder vectors count mismatch: expected {activation_matrix._nnz()} "
+                f"active features, got {decoder_vecs.shape[0]}"
+            )
+            assert decoder_vecs.shape[1] == d_model, (
+                f"Decoder vectors dimension mismatch: expected d_model={d_model}, "
+                f"got {decoder_vecs.shape[1]}"
+            )
 
         # Forward-pass cache
         self._resid_activations: List[torch.Tensor | None] = [None] * (n_layers + 1)
@@ -210,6 +240,31 @@ class AttributionContext:
         Returns:
             torch.Tensor: ``(batch, row_size)`` matrix - one row per node.
         """
+        
+        # Debug invariance checks
+        if DEBUG_MODE:
+            assert layers.shape == positions.shape, (
+                f"Layers and positions must have same shape: "
+                f"layers={layers.shape}, positions={positions.shape}"
+            )
+            assert inject_values.shape[0] == layers.shape[0], (
+                f"Inject values batch size mismatch: expected {layers.shape[0]}, "
+                f"got {inject_values.shape[0]}"
+            )
+            assert self._resid_activations[0] is not None, "Forward pass not yet executed"
+            
+            # Check layer indices are valid
+            assert (layers >= 0).all() and (layers < self.n_layers).all(), (
+                f"Invalid layer indices: must be in [0, {self.n_layers}), "
+                f"got min={layers.min()}, max={layers.max()}"
+            )
+            
+            # Check position indices are valid
+            n_pos = self._resid_activations[0].shape[1]
+            assert (positions >= 0).all() and (positions < n_pos).all(), (
+                f"Invalid position indices: must be in [0, {n_pos}), "
+                f"got min={positions.min()}, max={positions.max()}"
+            )
 
         batch_size = self._resid_activations[0].shape[0]
         self._batch_buffer = torch.zeros(

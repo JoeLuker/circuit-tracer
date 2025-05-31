@@ -8,6 +8,7 @@ from torch import nn
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
+from circuit_tracer.config import DEBUG_MODE
 from circuit_tracer.transcoder import SingleLayerTranscoder, load_transcoder_set
 
 
@@ -165,6 +166,35 @@ class ReplacementModel(HookedTransformer):
         feature_output_hook: str,
         scan: Optional[Union[str, List[str]]],
     ):
+        if DEBUG_MODE:
+            # Check that transcoders are provided for all layers
+            assert len(transcoders) == self.cfg.n_layers, (
+                f"Number of transcoders ({len(transcoders)}) must match "
+                f"number of layers ({self.cfg.n_layers})"
+            )
+            # Check that all transcoders have consistent dimensions
+            d_transcoder = None
+            d_model = None
+            for layer, transcoder in transcoders.items():
+                assert 0 <= layer < self.cfg.n_layers, (
+                    f"Invalid layer index {layer}, must be in [0, {self.cfg.n_layers})"
+                )
+                if d_transcoder is None:
+                    d_transcoder = transcoder.d_transcoder
+                    d_model = transcoder.d_model
+                else:
+                    assert transcoder.d_transcoder == d_transcoder, (
+                        f"Inconsistent d_transcoder: layer {layer} has {transcoder.d_transcoder}, "
+                        f"expected {d_transcoder}"
+                    )
+                    assert transcoder.d_model == d_model, (
+                        f"Inconsistent d_model: layer {layer} has {transcoder.d_model}, "
+                        f"expected {d_model}"
+                    )
+            assert d_model == self.cfg.d_model, (
+                f"Transcoder d_model ({d_model}) must match model d_model ({self.cfg.d_model})"
+            )
+        
         for transcoder in transcoders.values():
             transcoder.to(self.cfg.device, self.cfg.dtype)
 
@@ -368,6 +398,12 @@ class ReplacementModel(HookedTransformer):
             assert isinstance(inputs, str), "Inputs must be a string"
             tokenized = self.tokenizer(inputs, return_tensors="pt").input_ids.to(self.cfg.device)
             tokens = tokenized.squeeze(0)
+        
+        if DEBUG_MODE:
+            assert len(tokens) > 0, "Input tokens cannot be empty"
+            assert tokens.max() < self.cfg.d_vocab, (
+                f"Token index {tokens.max()} exceeds vocabulary size {self.cfg.d_vocab}"
+            )
 
         special_tokens = []
         for special_token in self.tokenizer.special_tokens_map.values():
@@ -428,6 +464,34 @@ class ReplacementModel(HookedTransformer):
             activation_matrix = activation_matrix.coalesce()
 
         token_vectors = self.W_E[tokens].detach()  # (n_pos, d_model)
+        
+        if DEBUG_MODE:
+            # Check output shapes and values
+            assert activation_matrix.shape == (self.cfg.n_layers, len(tokens), self.d_transcoder), (
+                f"Activation matrix shape mismatch: expected "
+                f"{(self.cfg.n_layers, len(tokens), self.d_transcoder)}, "
+                f"got {activation_matrix.shape}"
+            )
+            assert error_vectors.shape == (self.cfg.n_layers, len(tokens), self.cfg.d_model), (
+                f"Error vectors shape mismatch: expected "
+                f"{(self.cfg.n_layers, len(tokens), self.cfg.d_model)}, "
+                f"got {error_vectors.shape}"
+            )
+            assert token_vectors.shape == (len(tokens), self.cfg.d_model), (
+                f"Token vectors shape mismatch: expected {(len(tokens), self.cfg.d_model)}, "
+                f"got {token_vectors.shape}"
+            )
+            # Check for NaN/Inf values
+            assert torch.isfinite(logits).all(), "Logits contain NaN/Inf values"
+            if not sparse:
+                assert torch.isfinite(activation_matrix).all(), "Activation matrix contains NaN/Inf values"
+            assert torch.isfinite(error_vectors).all(), "Error vectors contain NaN/Inf values"
+            assert torch.isfinite(token_vectors).all(), "Token vectors contain NaN/Inf values"
+            # Check FVU values are in reasonable range
+            assert (fvu_values >= 0).all() and (fvu_values <= 1).all(), (
+                f"FVU values must be in [0, 1], got min={fvu_values.min()}, max={fvu_values.max()}"
+            )
+        
         return logits, activation_matrix, error_vectors, token_vectors
 
     def setup_intervention_with_freeze(
@@ -543,6 +607,53 @@ class ReplacementModel(HookedTransformer):
                 testing purposes, as attribution predicts the change in pre-activation
                 feature values.
         """
+        
+        if DEBUG_MODE:
+            # Get input length for validation
+            if isinstance(inputs, torch.Tensor):
+                input_length = inputs.shape[-1]
+            else:
+                input_length = len(self.tokenizer.encode(inputs))
+            
+            # Validate all interventions
+            for layer, pos, feature_idx, value in interventions:
+                assert 0 <= layer < self.cfg.n_layers, (
+                    f"Invalid layer index {layer}, must be in [0, {self.cfg.n_layers})"
+                )
+                
+                # Validate position
+                if isinstance(pos, int):
+                    assert 0 <= pos < input_length, (
+                        f"Invalid position {pos}, must be in [0, {input_length})"
+                    )
+                elif isinstance(pos, slice):
+                    # Check slice bounds if they're specified
+                    if pos.start is not None:
+                        assert 0 <= pos.start < input_length, (
+                            f"Invalid slice start {pos.start}, must be in [0, {input_length})"
+                        )
+                    if pos.stop is not None:
+                        assert 0 < pos.stop <= input_length, (
+                            f"Invalid slice stop {pos.stop}, must be in (0, {input_length}]"
+                        )
+                elif isinstance(pos, torch.Tensor):
+                    assert pos.ndim == 1, "Position tensor must be 1D"
+                    assert (pos >= 0).all() and (pos < input_length).all(), (
+                        f"Invalid position indices in tensor, must be in [0, {input_length})"
+                    )
+                
+                # Validate feature index
+                assert 0 <= feature_idx < self.d_transcoder, (
+                    f"Invalid feature index {feature_idx}, must be in [0, {self.d_transcoder})"
+                )
+                
+                # Validate value
+                if isinstance(value, (int, float)):
+                    assert not (torch.isnan(torch.tensor(value)) or torch.isinf(torch.tensor(value))), (
+                        f"Intervention value cannot be NaN or Inf"
+                    )
+                elif isinstance(value, torch.Tensor):
+                    assert torch.isfinite(value).all(), "Intervention values contain NaN/Inf"
 
         interventions_by_layer = defaultdict(list)
         for layer, pos, feature_idx, value in interventions:

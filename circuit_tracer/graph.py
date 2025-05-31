@@ -3,6 +3,8 @@ from typing import List, NamedTuple, Optional, Union
 import torch
 from transformer_lens import HookedTransformerConfig
 
+from circuit_tracer.config import DEBUG_MODE
+
 
 class Graph:
     input_string: str
@@ -56,6 +58,53 @@ class Graph:
                 transcoders used in the graph. Without a scan, the graph cannot be uploaded
                 (since we won't know what transcoders were used). Defaults to None
         """
+        # Debug invariance checks
+        if DEBUG_MODE:
+            n_features = len(selected_features)
+            n_tokens = len(input_tokens)
+            n_logits = len(logit_tokens)
+            n_errors = cfg.n_layers * n_tokens
+            n_nodes = n_features + n_errors + n_tokens + n_logits
+            
+            # Check adjacency matrix is square and has correct size
+            assert adjacency_matrix.shape == (n_nodes, n_nodes), (
+                f"Adjacency matrix must be square with size {n_nodes}x{n_nodes}, "
+                f"got {adjacency_matrix.shape}"
+            )
+            
+            # Check active features shape
+            assert active_features.ndim == 2 and active_features.shape[1] == 3, (
+                f"Active features must have shape (n_active, 3), got {active_features.shape}"
+            )
+            
+            # Check that selected features is a subset of active features
+            assert len(selected_features) <= len(active_features), (
+                f"Selected features ({len(selected_features)}) cannot exceed "
+                f"active features ({len(active_features)})"
+            )
+            
+            # Check activation values match selected features
+            assert len(activation_values) == len(selected_features), (
+                f"Activation values count ({len(activation_values)}) must match "
+                f"selected features count ({len(selected_features)})"
+            )
+            
+            # Check logit probabilities
+            assert len(logit_probabilities) == n_logits, (
+                f"Logit probabilities count ({len(logit_probabilities)}) must match "
+                f"logit tokens count ({n_logits})"
+            )
+            assert (logit_probabilities >= 0).all() and (logit_probabilities <= 1).all(), (
+                "Logit probabilities must be in [0, 1]"
+            )
+            assert torch.abs(logit_probabilities.sum() - 1.0) < 1e-5, (
+                f"Logit probabilities must sum to 1, got {logit_probabilities.sum()}"
+            )
+            
+            # Check no NaN/Inf values
+            assert torch.isfinite(adjacency_matrix).all(), "Adjacency matrix contains NaN/Inf values"
+            assert torch.isfinite(activation_values).all(), "Activation values contain NaN/Inf values"
+        
         self.input_string = input_string
         self.adjacency_matrix = adjacency_matrix
         self.cfg = cfg
@@ -127,6 +176,14 @@ def compute_influence(A: torch.Tensor, logit_weights: torch.Tensor, max_iter: in
     # and do logit_weights @ B
     # But it's faster / more efficient to compute logit_weights @ A + logit_weights @ A^2
     # as follows:
+    
+    if DEBUG_MODE:
+        assert A.shape[0] == A.shape[1], f"A must be square, got {A.shape}"
+        assert logit_weights.shape[0] == A.shape[0], (
+            f"Logit weights dimension mismatch: expected {A.shape[0]}, got {logit_weights.shape[0]}"
+        )
+        assert torch.isfinite(A).all(), "Matrix A contains NaN/Inf values"
+        assert torch.isfinite(logit_weights).all(), "Logit weights contain NaN/Inf values"
 
     current_influence = logit_weights @ A
     influence = current_influence
@@ -139,6 +196,13 @@ def compute_influence(A: torch.Tensor, logit_weights: torch.Tensor, max_iter: in
         current_influence = current_influence @ A
         influence += current_influence
         iterations += 1
+        
+        if DEBUG_MODE and iterations % 100 == 0:
+            # Check for numerical stability
+            assert torch.isfinite(influence).all(), (
+                f"Influence computation became unstable at iteration {iterations}"
+            )
+    
     return influence
 
 
@@ -207,6 +271,15 @@ def prune_graph(
     node_mask = node_influence >= find_threshold(node_influence, node_threshold)
     # Always keep tokens and logits
     node_mask[-n_logits - n_tokens :] = True
+    
+    if DEBUG_MODE:
+        # Check that tokens and logits are never pruned
+        assert node_mask[-n_logits - n_tokens :].all(), (
+            "Tokens and logits must never be pruned"
+        )
+        # Check node influence values are valid
+        assert torch.isfinite(node_influence).all(), "Node influence contains NaN/Inf values"
+        assert (node_influence >= 0).all(), "Node influence must be non-negative"
 
     # Create pruned matrix with selected nodes
     pruned_matrix = graph.adjacency_matrix.clone()
@@ -228,7 +301,17 @@ def prune_graph(
     # iteratively prune until all nodes missing incoming / outgoing edges are gone
     # (each pruning iteration potentially opens up new candidates for pruning)
     # this should not take more than n_layers + 1 iterations
+    iteration_count = 0
+    max_iterations = graph.cfg.n_layers + 2  # Should converge within n_layers + 1
+    
     while not torch.all(node_mask == old_node_mask):
+        if DEBUG_MODE:
+            iteration_count += 1
+            assert iteration_count <= max_iterations, (
+                f"Pruning failed to converge after {iteration_count} iterations "
+                f"(max expected: {max_iterations})"
+            )
+        
         old_node_mask[:] = node_mask
         edge_mask[~node_mask] = False
         edge_mask[:, ~node_mask] = False
@@ -237,11 +320,38 @@ def prune_graph(
         node_mask[: -n_logits - n_tokens] &= edge_mask[:, : -n_logits - n_tokens].any(0)
         # Ensure feature nodes have incoming edges
         node_mask[:n_features] &= edge_mask[:n_features].any(1)
+        
+        if DEBUG_MODE:
+            # Ensure tokens and logits are still kept
+            assert node_mask[-n_logits - n_tokens :].all(), (
+                "Tokens and logits were incorrectly pruned during iteration"
+            )
 
     # Calculate cumulative influence scores
     sorted_scores, sorted_indices = torch.sort(node_influence, descending=True)
     cumulative_scores = torch.cumsum(sorted_scores, dim=0) / torch.sum(sorted_scores)
     final_scores = torch.zeros_like(node_influence)
     final_scores[sorted_indices] = cumulative_scores
+    
+    if DEBUG_MODE:
+        # Check final invariants
+        assert edge_mask.shape == graph.adjacency_matrix.shape, (
+            "Edge mask shape mismatch"
+        )
+        assert node_mask.shape[0] == graph.adjacency_matrix.shape[0], (
+            "Node mask shape mismatch"
+        )
+        assert (cumulative_scores >= 0).all() and (cumulative_scores <= 1).all(), (
+            "Cumulative scores must be in [0, 1]"
+        )
+        # Check that pruned graph maintains connectivity for remaining nodes
+        pruned_adjacency = graph.adjacency_matrix * edge_mask
+        # Features and errors should have at least one outgoing edge if kept
+        kept_non_terminal = node_mask[: -n_logits - n_tokens]
+        if kept_non_terminal.any():
+            has_outgoing = pruned_adjacency[:, : -n_logits - n_tokens][kept_non_terminal].any(1)
+            assert has_outgoing.all(), (
+                "Some kept feature/error nodes have no outgoing edges"
+            )
 
     return PruneResult(node_mask, edge_mask, final_scores)
